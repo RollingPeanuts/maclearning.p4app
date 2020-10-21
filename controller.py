@@ -17,7 +17,7 @@ class MacLearningController(Thread):
         self.port_for_mac = {}
         self.stop_event = Event()
 
-    def addMacAddr(self, mac, port):
+    def addMacAddr(self, mac, port, ip):
         # Don't re-add the mac-port mapping if we already have it:
         if mac in self.port_for_mac: return
 
@@ -27,12 +27,17 @@ class MacLearningController(Thread):
                 action_params={'port': port})
         self.port_for_mac[mac] = port
 
+	self.sw.insertTableEntry(table_name='MyIngress.arp_cache',
+		match_fields={'hdr.arp.dstIP': [ip]},
+		action_name='MyIngress.return_arp',
+		action_params={'cachedMac': mac})
+
     def handleArpReply(self, pkt):
-        self.addMacAddr(pkt[ARP].hwsrc, pkt[CPUMetadata].srcPort)
+        self.addMacAddr(pkt[ARP].hwsrc, pkt[CPUMetadata].srcPort, pkt[ARP].psrc)
         self.send(pkt)
 
     def handleArpRequest(self, pkt):
-        self.addMacAddr(pkt[ARP].hwsrc, pkt[CPUMetadata].srcPort)
+        self.addMacAddr(pkt[ARP].hwsrc, pkt[CPUMetadata].srcPort, pkt[ARP].psrc)
         self.send(pkt)
 
     def handlePkt(self, pkt):

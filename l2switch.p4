@@ -28,6 +28,21 @@ header cpu_metadata_t {
     bit<16> srcPort;
 }
 
+header ipv4_t {
+        bit<4> version;
+        bit<4> ihl;
+        bit<8> diffserv;
+        bit<16> totalLen;
+        bit<16> identification;
+        bit<3> flags;
+        bit<13> fragOffset;
+        bit<8> ttl;
+        bit<8> protocol;
+        bit<16> hdrChecksum;
+        ip4Addr_t srcAddr;
+        ip4Addr_t dstAddr;
+}
+
 header arp_t {
     bit<16> hwType;
     bit<16> protoType;
@@ -44,6 +59,7 @@ header arp_t {
 struct headers {
     ethernet_t        ethernet;
     cpu_metadata_t    cpu_metadata;
+	ipv4_t		ipv4;
     arp_t             arp;
 }
 
@@ -62,6 +78,7 @@ parser MyParser(packet_in packet,
         transition select(hdr.ethernet.etherType) {
             TYPE_ARP: parse_arp;
             TYPE_CPU_METADATA: parse_cpu_metadata;
+		TYPE_IP: parse_ip;
             default: accept;
         }
     }
@@ -78,6 +95,11 @@ parser MyParser(packet_in packet,
         packet.extract(hdr.arp);
         transition accept;
     }
+
+	state parse_ip {
+		packet.extract(hdr.ip);
+		transition accept;
+	}
 }
 
 control MyVerifyChecksum(inout headers hdr, inout metadata meta) {
@@ -87,7 +109,9 @@ control MyVerifyChecksum(inout headers hdr, inout metadata meta) {
 control MyIngress(inout headers hdr,
                   inout metadata meta,
                   inout standard_metadata_t standard_metadata) {
-
+	/* Declarations */
+	bit<32> tmpIP;
+	
     action drop() {
         mark_to_drop();
     }
@@ -131,6 +155,36 @@ control MyIngress(inout headers hdr,
         default_action = drop();
     }
 
+	
+	action return_arp(macAddr_t cachedMac) {
+		/* Flip ethernet hdr addresss and ports */
+		hdr.ethernet.dstAddr = hdr.ethernet.srcAddr;
+		hdr.ethernet.srcAddr = cachedMac;
+		standard_metadata.egress_spec = standard_metadata.ingress_port;
+
+		/* Flip arp header values */
+		hdr.arp.opcode = 0x2;
+		tmpIP = hdr.arp.srcIP;
+		hdr.arp.srcIP = hdr.arp.dstIP;
+		hdr.arp.dstIP = tmpIP;
+		hdr.arp.dstEth = hdr.arp.srcEth;
+		hdr.arp.srcEth = cachedMac;
+	}
+		
+
+    table arp_cache {
+	key = {
+		hdr.arp.dstIP: exact;
+	}
+	actions = {
+		return_arp;
+		drop;
+		NoAction;
+	}
+	size = 1024;
+	default_action = NoAction();
+    }
+
 
     apply {
 
@@ -138,7 +192,10 @@ control MyIngress(inout headers hdr,
             cpu_meta_decap();
 
         if (hdr.arp.isValid() && standard_metadata.ingress_port != CPU_PORT) {
-            send_to_cpu();
+	    if(hdr.arp.opcode == 1 && !arp_cache.apply().hit)
+            	send_to_cpu();
+	    else if(hdr.arp.opcode == 2)
+		send_to_cpu();
         }
         else if (hdr.ethernet.isValid()) {
             fwd_l2.apply();
@@ -162,6 +219,7 @@ control MyDeparser(packet_out packet, in headers hdr) {
         packet.emit(hdr.ethernet);
         packet.emit(hdr.cpu_metadata);
         packet.emit(hdr.arp);
+	packet.emit(hdr.ip);
     }
 }
 
