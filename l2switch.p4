@@ -12,150 +12,199 @@ const port_t CPU_PORT           = 0x1;
 const bit<16> ARP_OP_REQ        = 0x0001;
 const bit<16> ARP_OP_REPLY      = 0x0002;
 
+const bit<16> TYPE_IP		= 0x0800;
 const bit<16> TYPE_ARP          = 0x0806;
 const bit<16> TYPE_CPU_METADATA = 0x080a;
 
+const bit<8>  TYPE_PWOSPF 	= 0x59;
+
 
 header ethernet_t {
-    macAddr_t dstAddr;
-    macAddr_t srcAddr;
-    bit<16>   etherType;
+	macAddr_t dstAddr;
+	macAddr_t srcAddr;
+	bit<16>   etherType;
 }
 
 header cpu_metadata_t {
-    bit<8> fromCpu;
-    bit<16> origEtherType;
-    bit<16> srcPort;
+	bit<8> fromCpu;
+	bit<16> origEtherType;
+	bit<16> srcPort;
 }
 
 header ipv4_t {
-        bit<4> version;
-        bit<4> ihl;
-        bit<8> diffserv;
-        bit<16> totalLen;
-        bit<16> identification;
-        bit<3> flags;
-        bit<13> fragOffset;
-        bit<8> ttl;
-        bit<8> protocol;
-        bit<16> hdrChecksum;
-        ip4Addr_t srcAddr;
-        ip4Addr_t dstAddr;
+	bit<4> version;
+	bit<4> ihl;
+	bit<8> diffserv;
+	bit<16> totalLen;
+	bit<16> identification;
+	bit<3> flags;
+	bit<13> fragOffset;
+	bit<8> ttl;
+	bit<8> protocol;
+	bit<16> hdrChecksum;
+	ip4Addr_t srcAddr;
+	ip4Addr_t dstAddr;
 }
 
 header arp_t {
-    bit<16> hwType;
-    bit<16> protoType;
-    bit<8> hwAddrLen;
-    bit<8> protoAddrLen;
-    bit<16> opcode;
-    // assumes hardware type is ethernet and protocol is IP
-    macAddr_t srcEth;
-    ip4Addr_t srcIP;
-    macAddr_t dstEth;
-    ip4Addr_t dstIP;
+	bit<16> hwType;
+	bit<16> protoType;
+	bit<8> hwAddrLen;
+	bit<8> protoAddrLen;
+	bit<16> opcode;
+	// assumes hardware type is ethernet and protocol is IP
+	macAddr_t srcEth;
+	ip4Addr_t srcIP;
+	macAddr_t dstEth;
+	ip4Addr_t dstIP;
+}
+
+header pwospf_t {
+	bit<8> version;
+	bit<8> type;
+	bit<16> len;
+	bit<32> routerId;
+	bit<32> areaId;
+	bit<16> checksum;
+	bit<16> auType;
+	bit<64> authentication;
 }
 
 struct headers {
-    ethernet_t        ethernet;
-    cpu_metadata_t    cpu_metadata;
+	ethernet_t        ethernet;
+	cpu_metadata_t    cpu_metadata;
 	ipv4_t		ipv4;
-    arp_t             arp;
+	arp_t             arp;
+	pwospf_t 	pwospf;
 }
 
 struct metadata { }
 
 parser MyParser(packet_in packet,
-                out headers hdr,
-                inout metadata meta,
-                inout standard_metadata_t standard_metadata) {
-    state start {
-        transition parse_ethernet;
-    }
+		out headers hdr,
+		inout metadata meta,
+		inout standard_metadata_t standard_metadata) {
+	state start {
+		transition parse_ethernet;
+	}
 
-    state parse_ethernet {
-        packet.extract(hdr.ethernet);
-        transition select(hdr.ethernet.etherType) {
-            TYPE_ARP: parse_arp;
-            TYPE_CPU_METADATA: parse_cpu_metadata;
-		TYPE_IP: parse_ip;
-            default: accept;
-        }
-    }
+	state parse_ethernet {
+		packet.extract(hdr.ethernet);
+		transition select(hdr.ethernet.etherType) {
+			TYPE_ARP: parse_arp;
+			TYPE_CPU_METADATA: parse_cpu_metadata;
+			TYPE_IP: parse_ip;
+			default: accept;
+		}
+	}
 
-    state parse_cpu_metadata {
-        packet.extract(hdr.cpu_metadata);
-        transition select(hdr.cpu_metadata.origEtherType) {
-            TYPE_ARP: parse_arp;
-            default: accept;
-        }
-    }
+	state parse_cpu_metadata {
+		packet.extract(hdr.cpu_metadata);
+		transition select(hdr.cpu_metadata.origEtherType) {
+			TYPE_ARP: parse_arp;
+			TYPE_IP:  parse_ip;
+			default: accept;
+		}
+	}
 
-    state parse_arp {
-        packet.extract(hdr.arp);
-        transition accept;
-    }
+	state parse_arp {
+		packet.extract(hdr.arp);
+		transition accept;
+	}
 
 	state parse_ip {
-		packet.extract(hdr.ip);
+		packet.extract(hdr.ipv4);
+		transition select(hdr.ipv4.protocol) {
+			TYPE_PWOSPF: parse_pwospf;
+			default: accept;
+		}
+	}
+
+	state parse_pwospf {
+		packet.extract(hdr.pwospf);
 		transition accept;
 	}
 }
 
 control MyVerifyChecksum(inout headers hdr, inout metadata meta) {
-    apply { }
+	apply { }
 }
 
 control MyIngress(inout headers hdr,
-                  inout metadata meta,
-                  inout standard_metadata_t standard_metadata) {
+		inout metadata meta,
+		inout standard_metadata_t standard_metadata) {
 	/* Declarations */
 	bit<32> tmpIP;
-	
-    action drop() {
-        mark_to_drop();
-    }
 
-    action set_egr(port_t port) {
-        standard_metadata.egress_spec = port;
-    }
+	action drop() {
+		mark_to_drop();
+	}
 
-    action set_mgid(mcastGrp_t mgid) {
-        standard_metadata.mcast_grp = mgid;
-    }
+	action set_egr(port_t port) {
+		standard_metadata.egress_spec = port;
+	}
 
-    action cpu_meta_encap() {
-        hdr.cpu_metadata.setValid();
-        hdr.cpu_metadata.origEtherType = hdr.ethernet.etherType;
-        hdr.cpu_metadata.srcPort = (bit<16>)standard_metadata.ingress_port;
-        hdr.ethernet.etherType = TYPE_CPU_METADATA;
-    }
+	action set_mgid(mcastGrp_t mgid) {
+		standard_metadata.mcast_grp = mgid;
+	}
 
-    action cpu_meta_decap() {
-        hdr.ethernet.etherType = hdr.cpu_metadata.origEtherType;
-        hdr.cpu_metadata.setInvalid();
-    }
+	action cpu_meta_encap() {
+		hdr.cpu_metadata.setValid();
+		hdr.cpu_metadata.origEtherType = hdr.ethernet.etherType;
+		hdr.cpu_metadata.srcPort = (bit<16>)standard_metadata.ingress_port;
+		hdr.ethernet.etherType = TYPE_CPU_METADATA;
+	}
 
-    action send_to_cpu() {
-        cpu_meta_encap();
-        standard_metadata.egress_spec = CPU_PORT;
-    }
+	action cpu_meta_decap() {
+		hdr.ethernet.etherType = hdr.cpu_metadata.origEtherType;
+		hdr.cpu_metadata.setInvalid();
+	}
 
-    table fwd_l2 {
-        key = {
-            hdr.ethernet.dstAddr: exact;
-        }
-        actions = {
-            set_egr;
-            set_mgid;
-            drop;
-            NoAction;
-        }
-        size = 1024;
-        default_action = drop();
-    }
+	action send_to_cpu() {
+		cpu_meta_encap();
+		standard_metadata.egress_spec = CPU_PORT;
+	}
 
-	
+	table fwd_l2 {
+		key = {
+			hdr.ethernet.dstAddr: exact;
+		}
+		actions = {
+			set_egr;
+			set_mgid;
+			drop;
+			NoAction;
+		}
+		size = 1024;
+		default_action = drop();
+	}
+
+	table fwd_ip {
+		key = {
+			hdr.ipv4.dstAddr: exact;
+		}
+		actions = {
+			set_mgid;
+			drop;
+			NoAction;
+		}
+		size = 1024;
+		default_action = NoAction();
+	}
+
+	table local_fwd {
+		key = {
+			hdr.ipv4.srcAddr: exact;
+		}
+		actions = {
+			set_egr;
+			drop;
+			NoAction;
+		}
+		size = 1024;
+		default_action = drop();
+	}
+
 	action return_arp(macAddr_t cachedMac) {
 		/* Flip ethernet hdr addresss and ports */
 		hdr.ethernet.dstAddr = hdr.ethernet.srcAddr;
@@ -170,64 +219,75 @@ control MyIngress(inout headers hdr,
 		hdr.arp.dstEth = hdr.arp.srcEth;
 		hdr.arp.srcEth = cachedMac;
 	}
-		
 
-    table arp_cache {
-	key = {
-		hdr.arp.dstIP: exact;
+
+	table arp_cache {
+		key = {
+			hdr.arp.dstIP: exact;
+		}
+		actions = {
+			return_arp;
+			drop;
+			NoAction;
+		}
+		size = 1024;
+		default_action = NoAction();
 	}
-	actions = {
-		return_arp;
-		drop;
-		NoAction;
+
+
+	apply {
+
+		if (standard_metadata.ingress_port == CPU_PORT)
+			cpu_meta_decap();
+
+		/* TODO: Change the logic here */
+		if(hdr.ipv4.isValid() && hdr.pwospf.isValid() && standard_metadata.ingress_port == CPU_PORT) {
+			/* fwd_ip.apply(); */
+			local_fwd.apply();	
+		}
+		else {
+			if (hdr.arp.isValid() && standard_metadata.ingress_port != CPU_PORT) {
+				if(hdr.arp.opcode == ARP_OP_REQ && !arp_cache.apply().hit)
+					send_to_cpu();
+				else if(hdr.arp.opcode == ARP_OP_REPLY)
+					send_to_cpu();
+			}
+			else if (hdr.pwospf.isValid() && standard_metadata.ingress_port != CPU_PORT) {
+				send_to_cpu();
+			}
+			else if (hdr.ethernet.isValid()) {
+				fwd_l2.apply();
+			}
+		}
+
 	}
-	size = 1024;
-	default_action = NoAction();
-    }
-
-
-    apply {
-
-        if (standard_metadata.ingress_port == CPU_PORT)
-            cpu_meta_decap();
-
-        if (hdr.arp.isValid() && standard_metadata.ingress_port != CPU_PORT) {
-	    if(hdr.arp.opcode == 1 && !arp_cache.apply().hit)
-            	send_to_cpu();
-	    else if(hdr.arp.opcode == 2)
-		send_to_cpu();
-        }
-        else if (hdr.ethernet.isValid()) {
-            fwd_l2.apply();
-        }
-
-    }
 }
 
 control MyEgress(inout headers hdr,
-                 inout metadata meta,
-                 inout standard_metadata_t standard_metadata) {
-    apply { }
+		inout metadata meta,
+		inout standard_metadata_t standard_metadata) {
+	apply { }
 }
 
 control MyComputeChecksum(inout headers  hdr, inout metadata meta) {
-    apply { }
+	apply { }
 }
 
 control MyDeparser(packet_out packet, in headers hdr) {
-    apply {
-        packet.emit(hdr.ethernet);
-        packet.emit(hdr.cpu_metadata);
-        packet.emit(hdr.arp);
-	packet.emit(hdr.ip);
-    }
+	apply {
+		packet.emit(hdr.ethernet);
+		packet.emit(hdr.cpu_metadata);
+		packet.emit(hdr.arp);
+		packet.emit(hdr.ipv4);
+		packet.emit(hdr.pwospf);
+	}
 }
 
 V1Switch(
-MyParser(),
-MyVerifyChecksum(),
-MyIngress(),
-MyEgress(),
-MyComputeChecksum(),
-MyDeparser()
+	MyParser(),
+	MyVerifyChecksum(),
+	MyIngress(),
+	MyEgress(),
+	MyComputeChecksum(),
+	MyDeparser()
 ) main;
