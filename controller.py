@@ -4,16 +4,18 @@ from scapy.all import Packet, Ether, IP, ARP
 from async_sniff import sniff
 from cpu_metadata import CPUMetadata
 from collections import namedtuple
-from periodic_send import PeriodicSenderThread
 from pwospf import Pwospf, Hello
+from pwospf_interfaces import PwospfIntf
 import time
 
 ARP_OP_REQ   = 0x0001
 ARP_OP_REPLY = 0x0002
 PWOSPF_TYPE_HELLO = 0x01
 PWOSPF_TYPE_LSU   = 0x04
-Pwospf_intf = namedtuple('Pwospf_intf', ['ip', 'mask', 'helloint', 'neighbors'])
-Pwospf_neighbor = namedtuple('Pwospf_neighbor', ['id', 'ip'])
+#Pwospf_intf = namedtuple('Pwospf_intf', ['ip', 'mask', 'helloint', 'neighbors'])
+#Pwospf_neighbor = namedtuple('Pwospf_neighbor', ['id', 'ip'])
+
+#MAX_INTF = 8
 
 class MacLearningController(Thread):
 	def __init__(self, sw, areaId, routerId, start_wait=0.3):
@@ -29,24 +31,11 @@ class MacLearningController(Thread):
 		self.areaId = areaId
 		self.lsuint = 60; # 60 seconds between each link status update broadcast
 
-		# PWOSPF Interface Setup 
-		self.pwospf_intfs = []
-		#TODO: Need to exclude adding interface 1, should never send back to CPU
-		for i in range(1, 9): # Take the first 8 ip values
-			ip = '10.0.' + str(routerId) + '.' + str(i) 
-			mask = '255.255.255.0'
-			helloint = 30
-			#neighborList = []
-			neighborList = {}
-			self.pwospf_intfs.append(Pwospf_intf(ip, mask, helloint, neighborList))
-			#sw.setIP(ip, prefixLen, sw.intfs[i])
-			self.sw.insertTableEntry(table_name='MyIngress.local_fwd',
-				match_fields={'hdr.ipv4.srcAddr': [ip]},
-				action_name='MyIngress.set_egr',
-				action_params={'port': i})
-				
+		# Initialize pwospf interfaces
+		self.pwospfIntf = PwospfIntf(sw, routerId, areaId)
 
-		self._helloSenderList = [];
+		# Set up Topology Database
+		self._networkTopo = [routerId]
 
 	def addMacAddr(self, mac, port, ip):
 		# Don't re-add the mac-port mapping if we already have it:
@@ -75,16 +64,16 @@ class MacLearningController(Thread):
 		# TODO: Establish this
 		return True	
 
-	def handleHello(self, pkt, intf, routerId): 
-		if(pkt[Hello].networkMask != intf.mask): return 
-		if(pkt[Hello].helloInt != intf.helloint): return 
-		srcIP = pkt[IP].src;
-		if srcIP not in intf.neighbors:
-			intf.neighbors[srcIP] = routerId;
-			print(srcIP, routerId)
-		else:
-			# Update Last Hello Packet Received Timer 
-			pass
+	#def handleHello(self, pkt, intf, routerId): 
+	#	if(pkt[Hello].networkMask != intf.mask): return 
+	#	if(pkt[Hello].helloInt != intf.helloint): return 
+	#	srcIP = pkt[IP].src;
+	#	if srcIP not in intf.neighbors:
+	#		intf.neighbors[srcIP] = routerId;
+	#		print(srcIP, routerId)
+	#	else:
+	#		# Update Last Hello Packet Received Timer 
+	#		pass
 
 	def handleLSU(self, pkt):
 		# TODO: Finish coding this
@@ -97,13 +86,15 @@ class MacLearningController(Thread):
 		if(pkt[Pwospf].auType != 0): return
 		if(not self.verifyPwospfChecksum(pkt)): return
 	
-		srcPort = pkt[CPUMetadata].srcPort
-		intf = self.pwospf_intfs[srcPort - 1]
-		routerId = pkt[Pwospf].routerId;
+		#intf = self.pwospf_intfs[srcPort - 1]
+		#srcPort = pkt[CPUMetadata].srcPort
+		#pktRouterId = pkt[Pwospf].routerId
+		#srcIP = pkt[IP].src
 		if pkt[Pwospf].type == PWOSPF_TYPE_HELLO:
-			self.handleHello(pkt, intf, routerId)
+			#self.handleHello(pkt, intf, routerId)
+			self.pwospfIntf.handleHelloPkt(pkt)
 		elif pkt[Pwospf].type == PWOSPF_TYPE_LSU:
-			self.handleLSU(pkt, intf)
+			self.handleLSU(pkt)
 
 	def handlePkt(self, pkt):
 		#pkt.show2()
@@ -131,16 +122,13 @@ class MacLearningController(Thread):
 		sendp(*args, **kwargs)
 
 	def run(self):
-		# TODO: Change the range so that every port (except 1) will have own hello msg sender
-		helloPktList = []
-		for i in range(2, 3): # To port 3
-			#TODO: Checksum aint right
-                	helloPktList.append(Ether()/CPUMetadata(fromCpu=1, origEtherType=0x800)/IP(src=self.pwospf_intfs[i].ip, dst='224.0.0.5', proto=89)/Pwospf(type=1, length=32, routerId=self.routerId, areaId=self.areaId, checksum=0)/Hello(networkMask=self.pwospf_intfs[i].mask, helloInt=self.pwospf_intfs[i].helloint))
-		#helloPktList[0].show2()
-
-		# TODO: Change the range so that every port (except 1) will have own hello msg sender
-		self._helloSenderList.append(PeriodicSenderThread(sw=self.sw, pkt=helloPktList[0], interval=10))
-		self._helloSenderList[0].start()
+		# Start up each hello pkt sender
+		#for i in range(0, MAX_INTF): # Start up hello senders for each port except 1
+		#	if(i == 0):
+		#		continue
+		#	else:
+		#		self._helloSenderList[i].start()
+		self.pwospfIntf.startHelloSenders()
 		sniff(iface=self.iface, prn=self.handlePkt, stop_event=self.stop_event)
 
 	def start(self, *args, **kwargs):
@@ -148,7 +136,8 @@ class MacLearningController(Thread):
 		time.sleep(self.start_wait)
 
 	def join(self, *args, **kwargs):
-		for i in range(len(self._helloSenderList)):
-			self._helloSenderList[i].join(*args, **kwargs)
+		#for i in range(len(self._helloSenderList)):
+			#if(self._helloSenderList[i]):	
+				#self._helloSenderList[i].join(*args, **kwargs)
 		self.stop_event.set()
 		super(MacLearningController, self).join(*args, **kwargs)

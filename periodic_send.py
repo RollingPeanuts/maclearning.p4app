@@ -44,9 +44,11 @@ class PeriodicSenderThread(Thread):
 		#self._stopped.set()
 
         def start(self, *args, **kwargs):
+		print("Thread Started!")
                 super(PeriodicSenderThread, self).start(*args, **kwargs)
                 time.sleep(self.start_wait)
 
 	def join(self, *args, **kwargs):
+		print("Thread Ended!")
                 self._stopped.set()
                 super(PeriodicSenderThread, self).join(*args, **kwargs)

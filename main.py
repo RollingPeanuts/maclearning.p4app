@@ -46,6 +46,7 @@ cpu2 = MacLearningController(sw2, areaId, routerId2)
 cpu2.start()
 
 h2, h4 = net.get('h2'), net.get('h4')
+#print sw1.deleteTableEntry
 
 #print topo.links();
 #print h2.cmd('arping -c1 10.0.0.3')
