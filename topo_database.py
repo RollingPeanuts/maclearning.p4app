@@ -1,109 +1,189 @@
 import time
 import collections
+from threading import RLock
+from timeout_checker import TimeoutChecker
+from scapy.all import Packet
+from pwospf import Pwospf, LSU, LSUAd
+
+RouterMetadata = collections.namedtuple('RouterMetadata', ['subnet', 'mask'])
+EntryData = collections.namedtuple('EntryData', ['expiration', 'isValid'])
 
 class TopoDatabase():
 	def __init__(self, routerId, lsuInt):
-		self._routerList = set()
+		#self._routerList = set()
+		self._databaseLock = RLock()
+		self._routerList = {}
 		self._database = {}
 		self._routerId = routerId
 		self._lsuInt = lsuInt
+		self._pathAdded = set()  # P4 currently lacks capability to modify table entries, once a route is set, add to the set, this route should not be modified anymore
+		self._timeoutChecker = TimeoutChecker(self, lsuInt)
+		self._timeoutChecker.start() # Start the timeout sender
 
-	def updateLink(self, fromRouter, toRouter = None):
-		#TODO: Add a system where lsu needs confirmation from both sides -> aka, set self._database[toRouter][fromRouter] to infinite ? Then check mask? Then updatePathing needs to check each key to see if its infinite then ignore that basically...
-		#TODO: Add locks
-		# Might need lock around _routerList too
-		assert fromRouter
-		if(fromRouter not in self._routerList):
-			self._routerList.add(fromRouter)
-			self._database[fromRouter] = {}
-		if(not toRouter):
-			return
-		if(toRouter not in self._routerList):
-			self._routerList.add(toRouter)
-			self._database[toRouter] = {}
-
-		# If connection didn't exist before, need to update routing table
-		#TODO: Lock here
-		needToUpdate = False
-		#if(toRouter not in self._database[fromRouter] or fromRouter not in self._database[toRouter]):
-		if(toRouter not in self._database[fromRouter]):
-			needToUpdate = True
-
-		currTime = time.time() #Time in seconds
-		expireTime = currTime + self._lsuInt * 3
-		self._database[fromRouter][toRouter] = expireTime
-		#self._database[toRouter][fromRouter] = expireTime
+	def convertIPtoSubnet(self, ip, mask):
+		print('converting!')
+		ipComponents = ip.split('.')
+		maskComponents = mask.split('.')
+		subnetComponents = []
+		for i in range(4):
+			subnetComponents.append(str(int(ipComponents[i]) & int(maskComponents[i])))	
+		subnet = '.'.join(subnetComponents)
+		print(ip + '->' + subnet)
 		
+
+	def updateLink(self, fromRouter, toRouterList, ip, mask):
+		subnet = self.convertIPtoSubnet(ip, mask)
+		self._databaseLock.acquire()
+		if(fromRouter not in self._database):
+			self._database[fromRouter] = {}
+		self._routerList[fromRouter] = RouterMetadata(subnet, mask)
+
+		needToUpdate = False
+		currTime = time.time()
+		expireTime = currTime + self._lsuInt * 3
+		for toRouter in toRouterList:
+			print('im updating shit')
+			if(toRouter not in self._database):
+				self._database[toRouter] = {}
+		
+			print(str(self._routerId) + '. ' + str(fromRouter) + '->' + str(toRouter))
+			if(fromRouter in self._database[toRouter]): # If toRouter already requested link to fromRouter, establish link
+				toRouterMetaData = self._routerList[toRouter]
+				if(toRouterMetaData.mask == mask):
+					self._database[fromRouter][toRouter] = EntryData(expireTime, True)
+					if(not self._database[toRouter][fromRouter].isValid): # Only establish for other router, if link is not currently established
+						savedExpiration = self._database[toRouter][fromRouter].expiration
+						self._database[toRouter][fromRouter] = EntryData(savedExpiration, True)
+						needToUpdate = True
+			else: # Else, establish intent to link between fromRouter and toRouter
+				print('link request established')
+				self._database[fromRouter][toRouter] = EntryData(expireTime, False)
+
 		if(needToUpdate):
 			self.updatePathing()
+		self._databaseLock.release()
+
 
 	# Determine which port to take to reach each topo connected subnet
 	def updatePathing(self):
 		# Implemented through BFS as each possible hop has equal weight
+		print('Database updated!')
 		visited = set()
 		visited.add(self._routerId)
 
 		# Best port to each neighbor of the current router is the port connecting to the neighbor
 		bestPort = {}
+		startQueue = []
 		for routerId in self._database[self._routerId].keys():
-			bestPort[routerId] = routerId 
-			visited.add(routerId)
+			if(self._database[self._routerId][routerId].isValid):
+				#print(routerId)
+				bestPort[routerId] = routerId 
+				visited.add(routerId)
+				startQueue.append(routerId)
 
 		#numRoutePorts = len(self._database[self._routerId].keys())
-		queue = collections.deque(self._database[self._routerId].keys())
+		queue = collections.deque(startQueue)
 		while(queue):
+			#print(queue)
 			currRouterId = queue.popleft()
 			currBestPort = bestPort[currRouterId]
 			for neighborRouter in self._database[currRouterId].keys():
-				if(neighborRouter not in visited):
-					bestPort[neighborRouter] = currBestPort
+				if(neighborRouter not in visited and self._database[currRouterId][neighborRouter].isValid):
 					visited.add(neighborRouter)
+					bestPort[neighborRouter] = currBestPort
 					queue.append(neighborRouter)
 			
 		# TODO: Update the routing table	
+		# TODO: Reset the next lsu message send time
 		# bestPort is a dictionary containing the best port (neighbor port) to take to each router/subnet
 		for key in bestPort.keys():
-     			print(str(key) + ": " + str(bestPort[key]))
+			if(key not in self._pathAdded):
+				self._pathAdded.add(key)
+			else:
+				pass #TODO: add to table
+			print(str(key) + ": " + str(bestPort[key]))
+		print(self._pathAdded)
 			
 
-	def removeLink(self, fromRouter, toRouter):
-		# TODO: Add locks, identical to updatelock
-		assert fromRouter in self._routerList		
-		assert toRouter in self._routerList
-		if(toRouter in self._database[fromRouter]):
-			del self._database[fromRouter][toRouter]
+	def removeLink(self, links):
+		if not links:
+			return
+
+		self._databaseLock.acquire()
+		needToUpdate = False
+		for (fromRouter, toRouter) in links:
+			assert fromRouter in self._database
+			assert toRouter in self._database
+			if(toRouter in self._database[fromRouter]):
+				if(self._database[fromRouter][toRouter].isValid):
+					expireTime = self._database[toRouter][fromRouter].expiration
+					self._database[toRouter][fromRouter] = EntryData(expireTime, False)
+					needToUpdate = True
+				print('Deleted: ' + str(fromRouter) + ' -> ' + str(toRouter))
+				del self._database[fromRouter][toRouter]
+		if(needToUpdate):
 			self.updatePathing()
+		self._databaseLock.release()
+
+	def checkExpireTimes(self):
+		self._databaseLock.acquire()
+		deleteList = []
+		for fromRouter in self._database.keys():
+			for toRouter in self._database[fromRouter].keys():
+				if(self._database[fromRouter][toRouter].expiration  < time.time()):
+					deleteList.append((fromRouter, toRouter))
+		self.removeLink(deleteList)
+		self._databaseLock.release()
+	
+	def handleLSUPkt(self, pkt):
+		print('handling packet!')
+		numLSU = pkt[LSU].numAds
+		assert numLSU
+
+		pktRouter = pkt[Pwospf].routerId
+		lsuList = pkt[LSU].lsuAdList
+		pktIP = lsuList[0].subnet
+		pktMask = lsuList[0].mask
+		linkRouters = []
+		#pkt.show2()
+		for lsuAd in lsuList:
+			linkRouters.append(lsuAd.routerId)
+
+		self.updateLink(pktRouter, linkRouters, pktIP, pktMask)
 		
 		
-newDatabase = TopoDatabase(1, 1)	
-print(1)
-newDatabase.updateLink(1, 7)
-#newDatabase.updateLink(7, 1, 1)
-print(2)
-newDatabase.updateLink(1, 2)
-#newDatabase.updateLink(2, 1, 1)
-print(3)
-newDatabase.updateLink(2, 3)
-#newDatabase.updateLink(3, 2, 1)
-print(4)
-newDatabase.updateLink(6, 2)
-#newDatabase.updateLink(2, 6, 1)
-print(5)
-newDatabase.updateLink(3, 5)
-#newDatabase.updateLink(5, 3, 1)
-print(6)
-newDatabase.updateLink(6, 5)
-#newDatabase.updateLink(5, 6, 1)
-print(7)
-newDatabase.updateLink(1, 6)
-print(8)
-newDatabase.removeLink(1, 6)
-print(8)
-newDatabase.updateLink(6, 1)
-print(8)
-newDatabase.updateLink(2, 4)
-#newDatabase.updateLink(4, 2, 1)
-print(9)
-newDatabase.updateLink(3, 4)
-#newDatabase.updateLink(4, 3, 1)
-print(10)
+#newDatabase = TopoDatabase(1, 3)	
+#print('1.')
+#newDatabase.updateLink(1,[7,2])
+#newDatabase.updateLink(7,[1])
+#newDatabase.updateLink(1, [5])
+#print('2.')
+#newDatabase.updateLink(2, [1])
+#print('3.')
+#newDatabase.updateLink(2, [3])
+#newDatabase.updateLink(3, [2])
+#print('4.')
+#newDatabase.updateLink(6, [2])
+#newDatabase.updateLink(2, [6])
+#print('5.')
+#newDatabase.updateLink(3, [5])
+#newDatabase.updateLink(5, [3])
+#print('6.')
+#newDatabase.updateLink(6, [5])
+#newDatabase.updateLink(5, [6])
+#print('7.')
+#newDatabase.updateLink(1, [6])
+#newDatabase.updateLink(6,[1])
+#print('8.')
+#newDatabase.removeLink([(1, 6)])
+#print('9.')
+#newDatabase.updateLink(1, [6])
+#print('10.')
+#newDatabase.updateLink(2, [4])
+#newDatabase.updateLink(4, [2])
+#print('11.')
+#newDatabase.updateLink(3, [4])
+#newDatabase.updateLink(4, [3])
+#print(10)
+
+#time.sleep(30)

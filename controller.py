@@ -4,8 +4,9 @@ from scapy.all import Packet, Ether, IP, ARP
 from async_sniff import sniff
 from cpu_metadata import CPUMetadata
 from collections import namedtuple
-from pwospf import Pwospf, Hello
+from pwospf import Pwospf, Hello, LSU
 from pwospf_interfaces import PwospfIntf
+from topo_database import TopoDatabase
 import time
 
 ARP_OP_REQ   = 0x0001
@@ -31,11 +32,13 @@ class MacLearningController(Thread):
 		self.areaId = areaId
 		self.lsuint = 60; # 60 seconds between each link status update broadcast
 
-		# Initialize pwospf interfaces
-		self.pwospfIntf = PwospfIntf(sw, routerId, areaId)
-
 		# Set up Topology Database
-		self._networkTopo = [routerId]
+		self.networkTopo = TopoDatabase(routerId, self.lsuint)  #TODO: Uncomment this
+		self.lsuSeqList = {}
+
+		# Initialize pwospf interfaces
+		self.pwospfIntf = PwospfIntf(sw, routerId, areaId, self.lsuint, self.networkTopo)
+
 
 	def addMacAddr(self, mac, port, ip):
 		# Don't re-add the mac-port mapping if we already have it:
@@ -74,25 +77,47 @@ class MacLearningController(Thread):
 	#	else:
 	#		# Update Last Hello Packet Received Timer 
 	#		pass
+	def handleHello(self, pkt):
+		assert Hello in pkt
+		self.pwospfIntf.handleHelloPkt(pkt)
 
 	def handleLSU(self, pkt):
-		# TODO: Finish coding this
-		pass
+		assert LSU in pkt
+		pktRouterId = pkt[Pwospf].routerId
+		pktSeqNum = pkt[LSU].seq
+		if(pktRouterId not in self.lsuSeqList):
+			self.lsuSeqList[pktRouterId] = pktSeqNum
+		elif(pktSeqNum <= self.lsuSeqList[pktRouterId]): 
+			return # Drop duplicate lsu packets
+		else:
+			self.lsuSeqList[pktRouterId] = pktSeqNum
+		self.networkTopo.handleLSUPkt(pkt)
+		if(pkt[LSU].ttl > 1): # Packet should be flooded if ttl is greater than 1
+			pkt[LSU].ttl -= 1
+			sendList = self.pwospfIntf.getFloodPacketList(pkt)
+			if(sendList):
+				#print(self.routerId)
+				#sendList[0].show2()
+				for sendPkt in sendList:
+					self.send(sendPkt)	
+			
 
 	def handlePwospf(self, pkt):
-		# TODO: Check IP header validity - make sure it is addressed to the current port
+		# TODO: Check IP header validity - make sure it is addressed to the current port, ttl stuff?
 		if(pkt[Pwospf].version != 2): return
 		if(pkt[Pwospf].areaId != self.areaId): return
 		if(pkt[Pwospf].auType != 0): return
 		if(not self.verifyPwospfChecksum(pkt)): return
+		if(pkt[Pwospf].routerId == self.routerId): return
 	
 		#intf = self.pwospf_intfs[srcPort - 1]
 		#srcPort = pkt[CPUMetadata].srcPort
 		#pktRouterId = pkt[Pwospf].routerId
 		#srcIP = pkt[IP].src
 		if pkt[Pwospf].type == PWOSPF_TYPE_HELLO:
+			self.handleHello(pkt)
 			#self.handleHello(pkt, intf, routerId)
-			self.pwospfIntf.handleHelloPkt(pkt)
+			#self.pwospfIntf.handleHelloPkt(pkt)
 		elif pkt[Pwospf].type == PWOSPF_TYPE_LSU:
 			self.handleLSU(pkt)
 
@@ -128,7 +153,7 @@ class MacLearningController(Thread):
 		#		continue
 		#	else:
 		#		self._helloSenderList[i].start()
-		self.pwospfIntf.startHelloSenders()
+		self.pwospfIntf.startIntfSenders()
 		sniff(iface=self.iface, prn=self.handlePkt, stop_event=self.stop_event)
 
 	def start(self, *args, **kwargs):
