@@ -1,12 +1,11 @@
 /* -*- P4_16 -*- */
-#include <core.p4>
+#include <core.p4> 
 #include <v1model.p4>
 
 typedef bit<9>  port_t;
 typedef bit<48> macAddr_t;
 typedef bit<32> ip4Addr_t;
-typedef bit<16> mcastGrp_t;
-
+typedef bit<16> mcastGrp_t; 
 const port_t CPU_PORT           = 0x1;
 
 const bit<16> ARP_OP_REQ        = 0x0001;
@@ -17,7 +16,6 @@ const bit<16> TYPE_ARP          = 0x0806;
 const bit<16> TYPE_CPU_METADATA = 0x080a;
 
 const bit<8>  TYPE_PWOSPF 	= 0x59;
-
 
 header ethernet_t {
 	macAddr_t dstAddr;
@@ -135,6 +133,8 @@ control MyIngress(inout headers hdr,
 		inout standard_metadata_t standard_metadata) {
 	/* Declarations */
 	bit<32> tmpIP;
+	bit<32> counterVal;
+	register<bit<32>>(3) counterReg;
 
 	action drop() {
 		mark_to_drop();
@@ -165,6 +165,12 @@ control MyIngress(inout headers hdr,
 		standard_metadata.egress_spec = CPU_PORT;
 	}
 
+	action ipv4_fwd(macAddr_t mac, port_t port) {
+		hdr.ethernet.dstAddr = mac;
+		standard_metadata.egress_spec = port;
+		hdr.ipv4.ttl = hdr.ipv4.ttl - 1;	
+	}
+
 	table fwd_l2 {
 		key = {
 			hdr.ethernet.dstAddr: exact;
@@ -176,15 +182,16 @@ control MyIngress(inout headers hdr,
 			NoAction;
 		}
 		size = 1024;
-		default_action = drop();
+		default_action = NoAction();
 	}
 
 	table fwd_ip {
 		key = {
-			hdr.ipv4.dstAddr: exact;
+			hdr.ipv4.dstAddr: lpm;
 		}
 		actions = {
-			set_mgid;
+			ipv4_fwd;
+			send_to_cpu;
 			drop;
 			NoAction;
 		}
@@ -202,7 +209,7 @@ control MyIngress(inout headers hdr,
 			NoAction;
 		}
 		size = 1024;
-		default_action = drop();
+		default_action = NoAction();
 	}
 
 	action return_arp(macAddr_t cachedMac) {
@@ -247,13 +254,29 @@ control MyIngress(inout headers hdr,
 		}
 		else {
 			if (hdr.arp.isValid() && standard_metadata.ingress_port != CPU_PORT) {
-				if(hdr.arp.opcode == ARP_OP_REQ && !arp_cache.apply().hit)
+				counterReg.read(counterVal, 1);
+				counterReg.write(0, counterVal + 1);
+				if(hdr.arp.opcode == ARP_OP_REQ && !arp_cache.apply().hit) {
+					counterReg.read(counterVal, 1);
+					counterReg.write(1, counterVal + 1);
 					send_to_cpu();
-				else if(hdr.arp.opcode == ARP_OP_REPLY)
+				}
+				else if(hdr.arp.opcode == ARP_OP_REPLY) {
+					counterReg.read(counterVal, 1);
+					counterReg.write(1, counterVal + 1);
 					send_to_cpu();
+				}
 			}
 			else if (hdr.pwospf.isValid() && standard_metadata.ingress_port != CPU_PORT) {
+				counterReg.read(counterVal, 1);
+				counterReg.write(1, counterVal + 1);
 				send_to_cpu();
+			}
+			else if(hdr.ipv4.isValid() && !hdr.arp.isValid()) {
+				counterReg.read(counterVal, 2);
+				counterReg.write(2, counterVal + 1);
+				fwd_ip.apply();	
+				fwd_l2.apply();
 			}
 			else if (hdr.ethernet.isValid()) {
 				fwd_l2.apply();
@@ -270,7 +293,23 @@ control MyEgress(inout headers hdr,
 }
 
 control MyComputeChecksum(inout headers  hdr, inout metadata meta) {
-	apply { }
+	apply {
+        	update_checksum(
+			hdr.ipv4.isValid(),
+			{ hdr.ipv4.version,
+			  hdr.ipv4.ihl,
+			  hdr.ipv4.diffserv,
+			  hdr.ipv4.totalLen,
+			  hdr.ipv4.identification,
+			  hdr.ipv4.flags,
+			  hdr.ipv4.fragOffset,
+			  hdr.ipv4.ttl,
+			  hdr.ipv4.protocol,
+			  hdr.ipv4.srcAddr,
+			  hdr.ipv4.dstAddr },
+			hdr.ipv4.hdrChecksum,
+			HashAlgorithm.csum16);
+	}
 }
 
 control MyDeparser(packet_out packet, in headers hdr) {

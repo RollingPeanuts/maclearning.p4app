@@ -15,7 +15,7 @@ Pwospf_neighbor = namedtuple('Pwospf_neighbor', ['id', 'ip'])
 MAX_INTF = 8
 
 class PwospfIntf():
-	def __init__(self, sw, routerId, areaId, lsuint, database):
+	def __init__(self, sw, routerId, areaId, lsuint, database, neighborInfo):
 	        # PWOSPF Interface Setup 
 		self.sw = sw
 		self.routerId = routerId
@@ -23,6 +23,7 @@ class PwospfIntf():
 		self.database = database
 		self.intfLock = Lock()
                 self.pwospf_intfs = []
+		self.neighborInfo = neighborInfo
                 #TODO: Need to exclude adding interface 1, should never send back to CPU, or maybe not -> currently just not sending hello packets on this intf
                 for i in range(1, MAX_INTF + 1): # Take the first 8 ip values
                         ip = '10.0.' + str(routerId) + '.' + str(i)
@@ -63,7 +64,7 @@ class PwospfIntf():
 		self._lsuSender = PeriodicLSUSenderThread(sw, self, lsuint) 
 
 	def handleHelloPkt(self, pkt):
-		print('Got a packet!')
+		#print('Got a packet!')
                 srcPort = pkt[CPUMetadata].srcPort 
                 intf = self.pwospf_intfs[srcPort - 1] 
                 if(pkt[Hello].networkMask != intf.mask): return 
@@ -80,6 +81,7 @@ class PwospfIntf():
                 if srcIP not in intf.neighbors:
 			needToUpdate = True
                         intf.neighbors[srcIP] = [pktRouterId, expireTime] #TODO: What if duplicate? If IP changes, then needs to signal update on topo?
+			self.neighborInfo[pktRouterId] = srcPort
 			print('Router ' + str(self.routerId) + ' added: ')
                         print(srcIP, pktRouterId)
                 else:
@@ -132,11 +134,11 @@ class PwospfIntf():
 				LSUlist.append(LSUAd(subnet=intf.ip, mask=intf.mask, routerId=intf.neighbors[neighborIP][0]))
 				#LSUlist.append(LSUAd(subnet=intf.ip, mask=intf.mask, routerId=self.routerId)) # TODO: For test only, remove in production
 		if not LSUlist:
-			print('No packets :(')
+			#print('No packets :(')
 			self.intfLock.release()
 			return None
 		
-		print('Packets yay!')
+		#print('Packets yay!')
 		#TODO: Checksum is wrong
 		numNeighbors = len(LSUlist)
 		pktList = []
@@ -154,7 +156,7 @@ class PwospfIntf():
 		receiveIP = pkt[IP].src
 		for intf in self.pwospf_intfs:
 			for neighborIP in intf.neighbors.keys():	
-				#if(neighborIP == receiveIP): continue #TODO: Uncomment this
+				if(neighborIP == receiveIP): continue #TODO: Uncomment this
 				#TODO: Checksum is wrong
 				pktList.append(Ether()/CPUMetadata(fromCpu=1, origEtherType=0x800)/IP(src=intf.ip, dst=neighborIP, proto=89)/Pwospf(type=4, length=pkt[Pwospf].length, routerId=pkt[Pwospf].routerId, areaId=pkt[Pwospf].areaId, checksum=0)/LSU(seq=pkt[LSU].seq, ttl=pkt[LSU].ttl, lsuAdList=pkt[LSU].lsuAdList))
 				
@@ -167,12 +169,10 @@ class PwospfIntf():
 	def startIntfSenders(self):
 		#TODO: Change this back
 		#for i in range(0, MAX_INTF): # Start up hello senders for each port except 1 
-		for i in range(2, 3):
+		for i in range(1, 3):
                 	if(i == 0): 
                         	continue 
                         else: 
                                 self._helloSenderList[i].start()
-		self._timeoutChecker.start()
+		#self._timeoutChecker.start() # TODO: Renable this
 		self._lsuSender.start()
-
-

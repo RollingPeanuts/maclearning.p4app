@@ -9,26 +9,29 @@ RouterMetadata = collections.namedtuple('RouterMetadata', ['subnet', 'mask'])
 EntryData = collections.namedtuple('EntryData', ['expiration', 'isValid'])
 
 class TopoDatabase():
-	def __init__(self, routerId, lsuInt):
+	def __init__(self, routerId, lsuInt, neighborInfo, sw):
 		#self._routerList = set()
 		self._databaseLock = RLock()
 		self._routerList = {}
 		self._database = {}
 		self._routerId = routerId
 		self._lsuInt = lsuInt
+		self.sw = sw
 		self._pathAdded = set()  # P4 currently lacks capability to modify table entries, once a route is set, add to the set, this route should not be modified anymore
 		self._timeoutChecker = TimeoutChecker(self, lsuInt)
-		self._timeoutChecker.start() # Start the timeout sender
+		#self._timeoutChecker.start() # Start the timeout sender #TODO: Renable this
+		self.neighborInfo = neighborInfo
 
 	def convertIPtoSubnet(self, ip, mask):
-		print('converting!')
+		#print('converting!')
 		ipComponents = ip.split('.')
 		maskComponents = mask.split('.')
 		subnetComponents = []
 		for i in range(4):
 			subnetComponents.append(str(int(ipComponents[i]) & int(maskComponents[i])))	
 		subnet = '.'.join(subnetComponents)
-		print(ip + '->' + subnet)
+		#print(ip + '->' + subnet)
+		return subnet
 		
 
 	def updateLink(self, fromRouter, toRouterList, ip, mask):
@@ -42,11 +45,11 @@ class TopoDatabase():
 		currTime = time.time()
 		expireTime = currTime + self._lsuInt * 3
 		for toRouter in toRouterList:
-			print('im updating shit')
+			#print('im updating shit')
 			if(toRouter not in self._database):
 				self._database[toRouter] = {}
 		
-			print(str(self._routerId) + '. ' + str(fromRouter) + '->' + str(toRouter))
+			#print(str(self._routerId) + '. ' + str(fromRouter) + '->' + str(toRouter))
 			if(fromRouter in self._database[toRouter]): # If toRouter already requested link to fromRouter, establish link
 				toRouterMetaData = self._routerList[toRouter]
 				if(toRouterMetaData.mask == mask):
@@ -95,14 +98,18 @@ class TopoDatabase():
 			
 		# TODO: Update the routing table	
 		# TODO: Reset the next lsu message send time
+		# TODO: Leave mac address  = 0, just set port is all you need
 		# bestPort is a dictionary containing the best port (neighbor port) to take to each router/subnet
+		print('Database for router ' + str(self._routerId))	
 		for key in bestPort.keys():
 			if(key not in self._pathAdded):
 				self._pathAdded.add(key)
-			else:
-				pass #TODO: add to table
+				self.sw.insertTableEntry(table_name = 'MyIngress.fwd_ip', match_fields = {'hdr.ipv4.dstAddr': [self._routerList[key].subnet, 24]}, action_name = 'MyIngress.ipv4_fwd', action_params = {'mac': '00:00:00:00:00:00', 'port': self.neighborInfo[bestPort[key]]})
+
+			#else:
+			#	pass #TODO: add to table
 			print(str(key) + ": " + str(bestPort[key]))
-		print(self._pathAdded)
+		#print(self._pathAdded)
 			
 
 	def removeLink(self, links):
@@ -136,7 +143,7 @@ class TopoDatabase():
 		self._databaseLock.release()
 	
 	def handleLSUPkt(self, pkt):
-		print('handling packet!')
+		#print('handling packet!')
 		numLSU = pkt[LSU].numAds
 		assert numLSU
 
